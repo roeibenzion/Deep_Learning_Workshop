@@ -1,0 +1,7 @@
+Pillow
+argparse
+matplotlib
+numpy
+opencv-python
+torch
+numba
