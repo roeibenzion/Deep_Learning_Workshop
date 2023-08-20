@@ -12,7 +12,6 @@ class BaseSegmentationDataset(Dataset):
         self.mask_path = mask_path
         self.data = sorted(os.listdir(os.path.join(root, image_path)))
         self.mask = sorted(os.listdir(os.path.join(root, mask_path)))
-
         if len(self.data) != len(self.mask):
             raise ValueError("Mismatch in the number of images and masks")
 

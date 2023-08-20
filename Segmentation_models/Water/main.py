@@ -9,7 +9,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
     parser.add_argument('--num_epochs', type=int, default=30, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--saved_model_name', default='.pth', help='Name of the saved model file')
+    parser.add_argument('--saved_model_name', default='water_seg', help='Name of the saved model file')
     parser.add_argument('--steps_per_epoch', type=int, default=550, help='Number of steps per epoch')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for the optimizer')
 
