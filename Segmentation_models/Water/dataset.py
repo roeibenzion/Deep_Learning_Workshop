@@ -41,5 +41,5 @@ class BeachDataset(BaseSegmentationDataset):
         super().__init__(root, image_path='images', mask_path='masks', transform=transform, mask_transform=mask_transform)
 
 class WaterSegmentationDataset(BaseSegmentationDataset):
-    def __init__(self, root, version='water_v2', transform=None, mask_transform=None, image_path='images', mask_path='masks'):
-        super().__init__(os.path.join(root, version), image_path=image_path, mask_path=mask_path, transform=transform, mask_transform=mask_transform)
+    def __init__(self, root, transform=None, mask_transform=None, image_path='images', mask_path='masks'):
+        super().__init__(root, image_path=image_path, mask_path=mask_path, transform=transform, mask_transform=mask_transform)

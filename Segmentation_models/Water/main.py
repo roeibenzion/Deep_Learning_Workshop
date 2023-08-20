@@ -12,7 +12,7 @@ def main():
     parser.add_argument('--saved_model_name', default='water_seg', help='Name of the saved model file')
     parser.add_argument('--steps_per_epoch', type=int, default=550, help='Number of steps per epoch')
     parser.add_argument('--weight_decay', type=float, default=0, help='Weight decay for the optimizer')
-
+    parser.add_argument('--transform_type', type=str, default='basic', help='What kind of augmentations')
     args = parser.parse_args()
 
     model = vgg16bn_unet(output_dim=1, pretrained=True)

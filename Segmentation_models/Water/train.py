@@ -110,6 +110,7 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4,display_
         if val_loss < best_val_loss:
             print(f"Validation loss decreased from {best_val_loss} to {val_loss}. Saving best model...")
             best_val_loss = val_loss
+            os.makedirs(save_dir, exist_ok=True)
             model_filename = f'{save_dir}/{saved_model_name}_val_loss{val_loss:.4f}.pth'
             torch.save(model.state_dict(), model_filename)
             epochs_no_improve = 0
@@ -119,8 +120,7 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4,display_
         # Early stopping if no improvement in validation loss
         if epochs_no_improve == patience:
             print(f"Early stopping after {patience} epochs without improvement.")
-            model_filename = f'{save_dir}/{saved_model_name}.pth'
-            torch.save(model.state_dict(), model_filename)
+            os.makedirs(save_dir, exist_ok=True)
             return best_val_loss
 
         print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss}, Train Accuracy: {train_accuracy}, Val Loss: {val_loss}, Val Accuracy: {val_accuracy}, Val IoU: {val_iou}")
@@ -128,7 +128,8 @@ def train_model(model, train_loader, val_loader, num_epochs=30, lr=1e-4,display_
         if (epoch + 1) % display_freq == 0:
             images, masks = next(iter(val_loader))
             outputs = model(images.to(device))
-            save_predictions_to_folder(images, masks, outputs, f'{save_dir}/{saved_model_name}/epoch_{epoch+1}')
+            os.makedirs(save_dir, exist_ok=True)
+            save_predictions_to_folder(images, masks, outputs, f'{save_dir}')
             del images, masks, outputs
     if torch.cuda.is_available():
       torch.cuda.empty_cache()

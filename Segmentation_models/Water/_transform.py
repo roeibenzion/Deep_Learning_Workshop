@@ -4,9 +4,10 @@ from PIL import Image
 import albumentations as A
 
 
-def get_transforms():
+def get_transforms(transform_type='basic'):
     dim = 320
 
+    # Define advanced transformations
     clahe_transform = A.CLAHE(p=1)  # CLAHE transformation
     grid_distortion = A.GridDistortion(p=1)  # Grid Distortion transformation
     optical_distortion = A.OpticalDistortion(p=1)  # Optical Distortion transformation
@@ -14,12 +15,15 @@ def get_transforms():
     random_brightness_contrast = A.RandomBrightnessContrast(p=0.5) # Random brightness and contrast
 
     def apply_custom_transforms(img):
-        #img_out = clahe_transform(image=np.array(img))["image"]
-        #img_out = grid_distortion(image=img_out)["image"]  # Apply Grid Distortion
-        #img_out = optical_distortion(image=img_out)["image"]  # Apply Optical Distortion
-        #img_out = elastic_transform(image=img_out)["image"]  # Apply Elastic Transformation
-        #img_out = random_brightness_contrast(image=img_out)["image"]  # Apply Random Brightness and Contrast
-        return img #Image.fromarray(img_out)
+        if transform_type == 'advanced':
+            img_out = clahe_transform(image=np.array(img))["image"]
+            img_out = grid_distortion(image=img_out)["image"]  # Apply Grid Distortion
+            img_out = optical_distortion(image=img_out)["image"]  # Apply Optical Distortion
+            img_out = elastic_transform(image=img_out)["image"]  # Apply Elastic Transformation
+            img_out = random_brightness_contrast(image=img_out)["image"]  # Apply Random Brightness and Contrast
+            return Image.fromarray(img_out)
+        else:
+            return img
 
     train_image_transform = transforms.Compose([
         lambda img: apply_custom_transforms(img),

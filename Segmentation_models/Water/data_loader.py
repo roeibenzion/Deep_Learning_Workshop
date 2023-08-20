@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader, random_split
 from _transform import get_transforms
 from dataset import WaterSegmentationDataset
 
-def get_datasets(root_path, val_split=0.2):
+def get_datasets(root_path, val_split=0.2,transform_type='basic'):
     """
     Splits the dataset into training and validation sets.
 
@@ -11,7 +11,7 @@ def get_datasets(root_path, val_split=0.2):
     :param val_split: Fraction of the dataset to be used for validation
     :return: Training and validation datasets
     """
-    train_image_transform, train_mask_transform, val_image_transform, val_mask_transform = get_transforms()
+    train_image_transform, train_mask_transform, val_image_transform, val_mask_transform = get_transforms(transform_type)
 
     # Create training and validation datasets with appropriate transforms
     train_dataset = WaterSegmentationDataset(root_path, transform=train_image_transform, mask_transform=train_mask_transform)
