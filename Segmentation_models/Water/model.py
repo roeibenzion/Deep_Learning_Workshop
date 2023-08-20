@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from torchvision.models import vgg13_bn, vgg16_bn, vgg19_bn
@@ -86,24 +87,25 @@ class VGGUnet(nn.Module):
 
         x = self.up_conv6(x)
         x = torch.cat([x, block5], dim=1)
-        x = self.conv6(x)
         x = self.dropout1(x) # Apply dropout
+        x = self.conv6(x)
 
         x = self.up_conv7(x)
         #print(block1.size(), block2.size(), block3.size(), block4.size(), block5.size())
         x = torch.cat([x, block4], dim=1)
-        x = self.conv7(x)
         x = self.dropout2(x) # Apply dropout
+        x = self.conv7(x)
 
         x = self.up_conv8(x)
         x = torch.cat([x, block3], dim=1)
-        x = self.conv8(x)
         x = self.dropout3(x) # Apply dropout
+        x = self.conv8(x)
+
 
         x = self.up_conv9(x)
         x = torch.cat([x, block2], dim=1)
-        x = self.conv9(x)
         x = self.dropout4(x) # Apply dropout
+        x = self.conv9(x)
 
         x = self.up_conv10(x)
         x = torch.cat([x, block1], dim=1)
