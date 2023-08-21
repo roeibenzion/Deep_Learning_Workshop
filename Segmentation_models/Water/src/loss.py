@@ -13,6 +13,25 @@ class CombinedLoss1(nn.Module):
         dice_loss = 1 - (2 * (pred * target).sum() + 1) / (pred.sum() + target.sum() + 1)
         return self.alpha * bce_loss + (1 - self.alpha) * dice_loss
 
+class CombinedLoss11(nn.Module):
+    def __init__(self, alpha=0.5, gamma=2, beta=1):
+        super(CombinedLoss1, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.beta = beta
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def forward(self, pred, target,modle):
+        bce_loss = self.bce(pred, target)
+        pred_prob = torch.sigmoid(pred)
+        # Focal loss component for hard-to-classify examples
+        focal_weight = self.alpha * (1 - pred_prob).pow(self.gamma)
+        focal_loss = focal_weight * bce_loss
+        # Dice loss component for localization
+        dice_loss = 1 - (2 * (pred_prob * target).sum() + 1) / (pred_prob.sum() + target.sum() + 1)
+        # Combined loss with balancing factor
+        loss = focal_loss.mean() + self.beta * dice_loss
+        return loss
 class CombinedLoss_with_w(nn.Module):
     def __init__(self, alpha=0.5, beta=0.005):
         super(CombinedLoss_with_w, self).__init__()
