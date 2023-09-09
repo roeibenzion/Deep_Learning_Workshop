@@ -1,7 +1,7 @@
 import torch.utils.data as data
-from PIL import Image
 import torchvision.transforms as transforms
-
+import torch
+import numpy as np
 
 class BaseDataset(data.Dataset):
     def __init__(self):
@@ -20,43 +20,54 @@ class BaseDataset(data.Dataset):
     def __len__(self):
         return 0
 
+def add_gaussian_noise(image, mean=0, std_dev=0.1):
+    image_array = np.array(image)
+    noise = np.random.normal(mean, std_dev, image_array.shape)
+    noisy_image = image_array + noise * 255
+    noisy_image = np.clip(noisy_image, 0, 255).astype(np.uint8)
+    return Image.fromarray(noisy_image)
 
-def get_transform(opt):
-    transform_list = []
-    # Modify transform to specify width and height
+from PIL import Image, ImageFilter
+import random
+
+def random_gaussian_blur(img):
+    if random.random() < 0.5:
+        return img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.1, 2.0)))
+    return img
+
+def get_transform(opt, is_seg=False):
+    image_transform_list = []
+    seg_transform_list = []
+    
     if opt.resize_or_crop == 'resize_and_crop':
         osize = [opt.loadSizeH, opt.loadSizeW]
         fsize = [opt.fineSizeH, opt.fineSizeW]
-        transform_list.append(transforms.Resize(osize, Image.BICUBIC))
-        transform_list.append(transforms.RandomCrop(fsize))
-    # Original CycleGAN code
-    # if opt.resize_or_crop == 'resize_and_crop':
-    #     osize = [opt.loadSize, opt.loadSize]
-    #     transform_list.append(transforms.Resize(osize, Image.BICUBIC))
-    #     transform_list.append(transforms.RandomCrop(opt.fineSize))
-    # elif opt.resize_or_crop == 'crop':
-    #     transform_list.append(transforms.RandomCrop(opt.fineSize))
-    # elif opt.resize_or_crop == 'scale_width':
-    #     transform_list.append(transforms.Lambda(
-    #         lambda img: __scale_width(img, opt.fineSize)))
-    # elif opt.resize_or_crop == 'scale_width_and_crop':
-    #     transform_list.append(transforms.Lambda(
-    #         lambda img: __scale_width(img, opt.loadSize)))
-    #     transform_list.append(transforms.RandomCrop(opt.fineSize))
-    # elif opt.resize_or_crop == 'none':
-    #     transform_list.append(transforms.Lambda(
-    #         lambda img: __adjust(img)))
+        image_transform_list.append(transforms.Resize(osize, Image.BICUBIC))
+        seg_transform_list.append(transforms.Resize(osize, Image.NEAREST))
+        
+        image_transform_list.append(transforms.RandomCrop(fsize))
+        seg_transform_list.append(transforms.RandomCrop(fsize))
     else:
         raise ValueError('--resize_or_crop %s is not a valid option.' % opt.resize_or_crop)
-
+        
     if opt.isTrain and not opt.no_flip:
-        transform_list.append(transforms.RandomHorizontalFlip())
-
-    transform_list += [transforms.ToTensor(),
-                       transforms.Normalize((0.5, 0.5, 0.5),
-                                            (0.5, 0.5, 0.5))]
-    return transforms.Compose(transform_list)
-
+        image_transform_list.append(transforms.RandomHorizontalFlip())
+        seg_transform_list.append(transforms.RandomHorizontalFlip())
+    
+    # Additional Augmentations
+    if opt.more_aug:
+        # image_transform_list.append(transforms.RandomRotation(10))  # Random rotation by up to 10 degrees
+        image_transform_list.append(transforms.Lambda(lambda img: random_gaussian_blur(img)))  # Random Gaussian blur
+        image_transform_list.append(transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05))  # Random color jittering
+        print('moreaug')
+        
+    image_transform_list += [transforms.ToTensor()]
+    seg_transform_list += [transforms.ToTensor()]
+    
+    seg_transform_list += [transforms.Normalize((0.5), (0.5))]
+    image_transform_list += [transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+    
+    return transforms.Compose(image_transform_list), transforms.Compose(seg_transform_list)
 
 # just modify the width and height to be multiple of 4
 def __adjust(img):
