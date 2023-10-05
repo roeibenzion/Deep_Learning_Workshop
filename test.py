@@ -2,18 +2,17 @@ import os
 import sys
 
 def test_floods():
-    os.chdir("Deep_Learning_Workshop/Instagan")
+    os.chdir("Instagan")
     os.system("python test.py --dataroot datasets/street2water --model instagan --name s2w2 --loadSizeH 320 --loadSizeW 320 --fineSizeH 320 --fineSizeW 320")
 
 def test_heat_waves():
-    os.chdir("Deep_Learning_Workshop")
     os.system("git clone https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix.git")
     os.system("cp -r pix2pix/* pytorch-CycleGAN-and-pix2pix/")
     os.chdir("pytorch-CycleGAN-and-pix2pix")
     os.system("python test.py --dataroot /path/to/your/data --name test --model cycle_gan --netG unet_256")
 
 def test_storms():
-    os.chdir("Deep_Learning_Workshop/style transfer/style transfer")
+    os.chdir("style transfer/style transfer")
     os.system("python style_transfer.py -c ./07.jpg -s ./cloudd.jpg -save out07 -steps 400 -style_weight 180000 -sharpness_weight 1.0")
     # Add similar lines for other images as needed
 

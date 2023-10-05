@@ -10,6 +10,11 @@ This section provides instructions for testing the three projects: Floods, Heat 
 - Clone this repository: `git clone https://github.com/roeibenzion/Deep_Learning_Workshop.git`
 - Navigate to the repository: `cd Deep_Learning_Workshop`
 
+### Install Dependencies
+After cloning the repository, you need to install the required Python packages. You can do this using pip:
+
+Run `pip install -r requirements.txt`
+
 ### Running Tests
 
 Run the `test.py` script with one of the following arguments: `floods`, `heat_waves`, or `storms`.
