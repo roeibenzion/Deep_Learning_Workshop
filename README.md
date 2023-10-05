@@ -32,7 +32,7 @@ Create and activate a new Conda environment using the provided `environment.yml`
 2. Activate the newly created environment:
 
     ```bash
-    conda activate env
+    conda activate dlw_env
     ```
 
 *Note: Replace `env` with the actual name of your environment as specified in the `environment.yml` file.*
