@@ -423,9 +423,9 @@ class ResnetBlock(nn.Module):
             residual = out.clone()  
             out = self.cbam(out)
             out += residual  
+            out = nn.ReLU(True)(out)
         else:
             out += x  
-        out = nn.ReLU(True)(out)  
         return out
 
 
