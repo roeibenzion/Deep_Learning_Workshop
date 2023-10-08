@@ -1,23 +1,23 @@
-import numpy as np
+import argparse
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from PIL import Image
-import torchvision.transforms as transforms
-import torchvision.models as models
-import argparse
 import torch.nn.functional as F
+import torch.optim as optim
 import torchvision
-import copy
-import cv2
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
 
 IMSIZE = 512
 STYLE_WEIGHT = 1000000
 CONTENT_WEIGHT = 1
+SHARPNESS_WEIGHT = 0.1
 NUM_STEPS = 300
 
 
 def image_loader(image_name):
+    """This function loads an image, resizes it to the desired image size and transforms it to tensor"""
     loader = transforms.Compose([
         transforms.Resize((IMSIZE, IMSIZE)),
         transforms.ToTensor()])
@@ -26,7 +26,20 @@ def image_loader(image_name):
     return image.to(device, torch.float)
 
 
+def gram_matrix(input):
+    """This function computes the gram matrix by calculating a dot product between the feature matrix and it's
+    transpose and then normalize it by dividing by the number of elements
+    it used for style loss calculation"""
+    batch, channel, height, width = input.size()
+    features = input.view(batch * channel, height * width)
+    G = torch.mm(features, features.t())
+    return G.div(batch * channel * height * width)
+
+
 class ContentLoss(nn.Module):
+    """ This class calculates the content loss between the content feature representation of the generated image and
+    a target content representation.
+    """
 
     def __init__(self, target, ):
         super(ContentLoss, self).__init__()
@@ -37,18 +50,13 @@ class ContentLoss(nn.Module):
         return input
 
 
-def gram_matrix(input):
-    batch, channel, height, width = input.size()
-    features = input.view(batch * channel, height * width)
-    G = torch.mm(features, features.t())
-    return G.div(batch * channel * height * width)
-
-
 class StyleLoss(nn.Module):
-
-    def __init__(self, target_feature):
+    """ This class calculates the style loss between the style feature representation of the generated image and
+        a target style representation by using the gram matrix of the features.
+        """
+    def __init__(self, target):
         super(StyleLoss, self).__init__()
-        self.target = gram_matrix(target_feature).detach()
+        self.target = gram_matrix(target).detach()
 
     def forward(self, input):
         G = gram_matrix(input)
@@ -57,6 +65,9 @@ class StyleLoss(nn.Module):
 
 
 class Normalization(nn.Module):
+    """This class represents image normalization (very first layer). It subtracts the mean values and divides by the
+    standard deviation values for each color channel. This normalization step helps ensure that the input image has a
+    similar distribution of pixel values as the data that the model was originally trained on"""
     def __init__(self):
         super(Normalization, self).__init__()
         mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
@@ -69,6 +80,10 @@ class Normalization(nn.Module):
 
 
 class SharpnessLoss(nn.Module):
+    """This class designed to compute a sharpness loss by measuring the difference between the original input tensor
+    and a blurred version of it obtained through average pooling. This loss can be used as a regularization term to
+    encourage the generated image to be less blurry and maintain sharpness during style transfer."""
+
     def forward(self, x):
         blurred = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         sharpness = torch.mean(torch.abs(x - blurred))
@@ -76,9 +91,11 @@ class SharpnessLoss(nn.Module):
 
 
 def get_style_model_and_losses(cnn, style_img, content_img):
+    """This function sets up the neural network model with the appropriate normalization, content and style loss
+    layers inserted at the desired layers within the model"""
     normalization = Normalization().to(device)
     # Desired layers to calculate content and style loss
-    content_layers = ['conv_4', 'conv_5']
+    content_layers = ['conv_4', 'conv_6']
     style_layers = ['conv_1', 'conv_2', 'conv_3', 'conv_4']
 
     content_losses = []
@@ -104,16 +121,18 @@ def get_style_model_and_losses(cnn, style_img, content_img):
         model.add_module(name, layer)
 
         # If the current layer is in desired content layers,
-        # add it to the the model
+        # add it to the model
         if name in content_layers:
+            # Calculate the content target and create a content loss module
             target = model(content_img).detach()
             content_loss = ContentLoss(target)
             model.add_module("content_loss_{}".format(i), content_loss)
             content_losses.append(content_loss)
 
         # If the current layer is in desired style layers,
-        # add it to the the sequential model
+        # add it to the sequential model
         if name in style_layers:
+            # Calculate the style target and create a style loss module
             target_feature = model(style_img).detach()
             style_loss = StyleLoss(target_feature)
             model.add_module("style_loss_{}".format(i), style_loss)
@@ -128,11 +147,15 @@ def get_style_model_and_losses(cnn, style_img, content_img):
 
 
 def get_input_optimizer(input_img):
+    """This function initializes an optimizer, an LBFGS optimizer, and sets it up to optimize the pixel values of the
+    input image tensor"""
     optimizer = optim.LBFGS([input_img])
     return optimizer
 
 
 def main(cnn, content_img, style_img, input_img, num_steps, style_weight, content_weight, sharpness_weight):
+    """This function performs the optimization process to generate an image that combines the content image
+    with the style of style image"""
     model, style_losses, content_losses = get_style_model_and_losses(cnn, style_img, content_img)
 
     # Optimize the input image not the network
@@ -188,11 +211,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', help="content image", required=True)
     parser.add_argument('-s', help="style image", required=True)
-    parser.add_argument('-style_weight', help="style weight", type=int, default=1000000)
-    parser.add_argument('-content_weight', help="content weight", type=int, default=1)
-    parser.add_argument('-steps', help="number of steps", type=int, default=300)
+    parser.add_argument('-style_weight', help="style weight", type=int, default=STYLE_WEIGHT)
+    parser.add_argument('-content_weight', help="content weight", type=int, default=CONTENT_WEIGHT)
+    parser.add_argument('-sharpness_weight', help="sharpness weight", type=float, default=SHARPNESS_WEIGHT)
+    parser.add_argument('-steps', help="number of steps", type=int, default=NUM_STEPS)
     parser.add_argument('-save', help="generated image name", type=str, required=True)
-    parser.add_argument('-sharpness_weight', help="sharpness weight", type=float, default=0.1)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -214,7 +237,7 @@ if __name__ == "__main__":
 
     image = Image.open(args.save + ".png")
 
-    # Define the desired output size (larger size)
+    # Define the desired output size (larger size) and save the image with the new size as "output_image.jpg"
     desired_width = 800
     desired_height = 600
 
