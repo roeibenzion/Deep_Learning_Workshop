@@ -137,10 +137,6 @@ class InstaGANModel(BaseModel):
     
 
     def set_input(self, input, epoch=-1):
-
-        if epoch%30 == 0:
-            #increase cycle consistency weight
-            self.opt.lambda_A *= 1.2
         AtoB = self.opt.direction == 'AtoB'
         
         self.real_A_img = input['A' if AtoB else 'B'].to(self.device)
