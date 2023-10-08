@@ -13,6 +13,12 @@ class TestOptions(BaseOptions):
         parser.add_argument('--num_test', type=int, default=50, help='how many test images to run')
         parser.add_argument('--more_aug', action='store_true', help='more aug')
 
+        parser.add_argument('--use_wgan', action='store_true', help='type to use WGAN-GP loss')
+        parser.add_argument('--use_vggblock', action='store_true', help='use VGGblock instead of resnetblock')
+        parser.add_argument('--smooth', action='store_true', help='use one sided label smoothing')
+        parser.add_argument('--cbam', action='store_true', help='use attention module')
+        parser.add_argument('--restarted', action='store_true', help='use restarted method')
+
         parser.set_defaults(model='test')
         # To avoid cropping, the loadSize should be the same as fineSize
         parser.set_defaults(loadSize=parser.get_default('fineSize'))

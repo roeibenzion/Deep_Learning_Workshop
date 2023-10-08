@@ -154,7 +154,6 @@ class GANLoss(nn.Module):
                 loss = input.mean()
         return loss
 
-
    
 def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', constant=1.0, lambda_gp=10.0):
     if lambda_gp > 0.0:
