@@ -3,6 +3,15 @@ import torch.nn as nn
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
+import numpy as np
+from torch.autograd import Variable
+from torch import Tensor
+from torch.nn import Parameter
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+import math
+
+
 
 ###############################################################################
 # Helper Functions
@@ -71,14 +80,14 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], vgg=False, cbam=False):
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
 
     if netG == 'basic':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
     elif netG == 'set':
-        net = ResnetSetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
+        net = ResnetSetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9, vgg=vgg, cbam=cbam)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -107,26 +116,68 @@ def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', use_sigmoid=False,
 # but it abstracts away the need to create the target label tensor
 # that has the same size as the input
 class GANLoss(nn.Module):
-    def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0):
+    def __init__(self, use_lsgan=True, target_real_label=1.0, target_fake_label=0.0, use_WAGAN=False, smooth_labels=False):
         super(GANLoss, self).__init__()
         self.register_buffer('real_label', torch.tensor(target_real_label))
         self.register_buffer('fake_label', torch.tensor(target_fake_label))
+        self.WGAN = use_WAGAN
+        self.smooth_labels = smooth_labels  # Add the smooth_labels option
         if use_lsgan:
             self.loss = nn.MSELoss()
+        elif self.WGAN:
+            self.loss = None
         else:
             self.loss = nn.BCELoss()
 
     def get_target_tensor(self, input, target_is_real):
-        if target_is_real:
-            target_tensor = self.real_label
+        if self.smooth_labels:
+            # Apply label smoothing
+            if target_is_real:
+                target_tensor = torch.rand_like(input) * 0.1 + 0.9  # Smooth real labels
+            else:
+                target_tensor = torch.rand_like(input) * 0.1  # Keep fake labels close to 0
         else:
-            target_tensor = self.fake_label
+            if target_is_real:
+                target_tensor = self.real_label
+            else:
+                target_tensor = self.fake_label
         return target_tensor.expand_as(input)
 
     def __call__(self, input, target_is_real):
         target_tensor = self.get_target_tensor(input, target_is_real)
-        return self.loss(input, target_tensor)
+        if not self.WGAN:
+            loss = self.loss(input, target_tensor)
+        else:
+            if target_is_real:
+                loss = -input.mean()
+            else:
+                loss = input.mean()
+        return loss
 
+
+   
+def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', constant=1.0, lambda_gp=10.0):
+    if lambda_gp > 0.0:
+        if type == 'real':   # either use real images, fake images, or a linear interpolation of two.
+            interpolatesv = real_data
+        elif type == 'fake':
+            interpolatesv = fake_data
+        elif type == 'mixed':
+            alpha = torch.rand(real_data.shape[0], 1, device=device)
+            alpha = alpha.expand(real_data.shape[0], real_data.nelement() // real_data.shape[0]).contiguous().view(*real_data.shape)
+            interpolatesv = alpha * real_data + ((1 - alpha) * fake_data)
+        else:
+            raise NotImplementedError('{} not implemented'.format(type))
+        interpolatesv.requires_grad_(True)
+        disc_interpolates = netD(interpolatesv)
+        gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolatesv,
+                                        grad_outputs=torch.ones(disc_interpolates.size()).to(device),
+                                        create_graph=True, retain_graph=True, only_inputs=True)
+        gradients = gradients[0].view(real_data.size(0), -1)  # flat the data
+        gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - constant) ** 2).mean() * lambda_gp        # added eps
+        return gradient_penalty, gradients
+    else:
+        return 0.0, None
 
 # Define spectral normalization layer
 # Code from Christian Cosgrove's repository
@@ -221,7 +272,7 @@ class ResnetGenerator(nn.Module):
         mult = 2**n_downsampling
         for i in range(n_blocks):
             model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
-
+        
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
             model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
@@ -234,7 +285,7 @@ class ResnetGenerator(nn.Module):
         model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
         model += [nn.Tanh()]
 
-        self.model = nn.Sequential(*model)
+        self.model = nn.Sequential(*model) 
 
     def forward(self, input):
         return self.model(input)
@@ -243,12 +294,13 @@ class ResnetGenerator(nn.Module):
 # ResNet generator for "set" of instance attributes
 # See https://openreview.net/forum?id=ryxwJhC9YX for details
 class ResnetSetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect'):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', vgg=False, cbam=False):
         assert (n_blocks >= 0)
         super(ResnetSetGenerator, self).__init__()
         self.input_nc = input_nc
         self.output_nc = output_nc
         self.ngf = ngf
+        self.use_CBAM = cbam 
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
@@ -259,50 +311,57 @@ class ResnetSetGenerator(nn.Module):
         self.encoder_seg = self.get_encoder(1, n_downsampling, ngf, norm_layer, use_dropout, n_blocks, padding_type, use_bias)
         self.decoder_img = self.get_decoder(output_nc, n_downsampling, 2 * ngf, norm_layer, use_bias)  # 2*ngf
         self.decoder_seg = self.get_decoder(1, n_downsampling, 3 * ngf, norm_layer, use_bias)  # 3*ngf
-
-    def get_encoder(self, input_nc, n_downsampling, ngf, norm_layer, use_dropout, n_blocks, padding_type, use_bias):
+        
+    def get_encoder(self, input_nc, n_downsampling, ngf, norm_layer, use_dropout, n_blocks, padding_type, use_bias, vgg=False):
         model = [nn.ReflectionPad2d(3),
-                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-                 norm_layer(ngf),
-                 nn.ReLU(True)]
+                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias)]
+        
+        model += [norm_layer(ngf)]
+
+        model += [nn.ReLU(True)]
 
         for i in range(n_downsampling):
             mult = 2 ** i
-            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                      norm_layer(ngf * mult * 2),
-                      nn.ReLU(True)]
+            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias)]
+            model += [norm_layer(ngf * mult * 2)]
+            model += [nn.ReLU(True)]
 
         mult = 2 ** n_downsampling
         for i in range(n_blocks):
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+            if not vgg:
+                model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, cbam=self.use_CBAM)]
+            else:
+                model += [VGGBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
 
         return nn.Sequential(*model)
-
+    
     def get_decoder(self, output_nc, n_downsampling, ngf, norm_layer, use_bias):
         model = []
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
-            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2, padding=1, output_padding=1, bias=use_bias),
-                      norm_layer(int(ngf * mult / 2)),
-                      nn.ReLU(True)]
+            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2, padding=1, output_padding=1, bias=use_bias)]
+            model += [norm_layer(int(ngf * mult / 2))]
+            model += [nn.ReLU(True)] 
+
         model += [nn.ReflectionPad2d(3)]
         model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
         model += [nn.Tanh()]
         return nn.Sequential(*model)
-
-    def forward(self, inp):
+    
+    def forward(self, inp, resolution=None):
         # split data
         img = inp[:, :self.input_nc, :, :]  # (B, CX, W, H)
         segs = inp[:, self.input_nc:, :, :]  # (B, CA, W, H)
         mean = (segs + 1).mean(0).mean(-1).mean(-1)
         if mean.sum() == 0:
             mean[0] = 1  # forward at least one segmentation
-#
+
         ## run encoder
         enc_img = self.encoder_img(img)
         # run encoder
         enc_img = self.encoder_img(img)
         enc_segs = [self.encoder_seg(segs[:, i, :, :].unsqueeze(1)) for i in range(segs.size(1)) if mean[i] > 0]
+
         enc_segs_stack = torch.stack(enc_segs, dim=0)  # Stack along a new dimension
         enc_segs_sum = torch.sum(enc_segs_stack, dim=0)  # Sum along the new dimension
 
@@ -318,12 +377,13 @@ class ResnetSetGenerator(nn.Module):
             else:
                 out += [segs[:, i, :, :].unsqueeze(1)]  # skip empty segmentation
         return torch.cat(out, dim=1)
-
+    
 # Define a resnet block
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias, cbam=False):
         super(ResnetBlock, self).__init__()
         self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.cbam = CBAM(dim) if cbam else None
 
     def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
         conv_block = []
@@ -354,6 +414,55 @@ class ResnetBlock(nn.Module):
             raise NotImplementedError('padding [%s] is not implemented' % padding_type)
         conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
                        norm_layer(dim)]
+        return nn.Sequential(*conv_block)
+
+    def forward(self, x):
+        #out = x + self.conv_block(x)
+        out = self.conv_block(x)
+        if self.cbam is not None:
+            residual = out.clone()  
+            out = self.cbam(out)
+            out += residual  
+        else:
+            out += x  
+        out = nn.ReLU(True)(out)  
+        return out
+
+
+class VGGBlock(nn.Module):
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+        super(VGGBlock, self).__init__()
+        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+
+    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+        conv_block = []
+        p = 1  # Set padding to 1 to match ResNet
+        if padding_type == 'reflect':
+            conv_block += [nn.ReflectionPad2d(1)]
+        elif padding_type == 'replicate':
+            conv_block += [nn.ReplicationPad2d(1)]
+        elif padding_type == 'zero':
+            p = 1
+        else:
+            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+
+        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
+                       norm_layer(dim),
+                       nn.ReLU(True)]
+        if use_dropout:
+            conv_block += [nn.Dropout(0.5)]
+
+        p = 1  # Set padding to 1 to match ResNet
+        if padding_type == 'reflect':
+            conv_block += [nn.ReflectionPad2d(1)]
+        elif padding_type == 'replicate':
+            conv_block += [nn.ReplicationPad2d(1)]
+        elif padding_type == 'zero':
+            p = 1
+        else:
+            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
+                       norm_layer(dim)]
 
         return nn.Sequential(*conv_block)
 
@@ -361,86 +470,62 @@ class ResnetBlock(nn.Module):
         out = x + self.conv_block(x)
         return out
 
-
-# Defines the Unet generator.
-# |num_downs|: number of downsamplings in UNet. For example,
-# if |num_downs| == 7, image of size 128x128 will become of size 1x1
-# at the bottleneck
-class UnetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, num_downs, ngf=64,
-                 norm_layer=nn.BatchNorm2d, use_dropout=False):
-        super(UnetGenerator, self).__init__()
-
-        # construct unet structure
-        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=None, norm_layer=norm_layer, innermost=True)
-        for i in range(num_downs - 5):
-            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer, use_dropout=use_dropout)
-        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer)
-        unet_block = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm_layer=norm_layer)
-
-        self.model = unet_block
-
-    def forward(self, input):
-        return self.model(input)
-
-
-# Defines the submodule with skip connection.
-# X -------------------identity---------------------- X
-#   |-- downsampling -- |submodule| -- upsampling --|
-class UnetSkipConnectionBlock(nn.Module):
-    def __init__(self, outer_nc, inner_nc, input_nc=None,
-                 submodule=None, outermost=False, innermost=False, norm_layer=nn.BatchNorm2d, use_dropout=False):
-        super(UnetSkipConnectionBlock, self).__init__()
-        self.outermost = outermost
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
-        if input_nc is None:
-            input_nc = outer_nc
-        downconv = nn.Conv2d(input_nc, inner_nc, kernel_size=4,
-                             stride=2, padding=1, bias=use_bias)
-        downrelu = nn.LeakyReLU(0.2, True)
-        downnorm = norm_layer(inner_nc)
-        uprelu = nn.ReLU(True)
-        upnorm = norm_layer(outer_nc)
-
-        if outermost:
-            upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc,
-                                        kernel_size=4, stride=2,
-                                        padding=1)
-            down = [downconv]
-            up = [uprelu, upconv, nn.Tanh()]
-            model = down + [submodule] + up
-        elif innermost:
-            upconv = nn.ConvTranspose2d(inner_nc, outer_nc,
-                                        kernel_size=4, stride=2,
-                                        padding=1, bias=use_bias)
-            down = [downrelu, downconv]
-            up = [uprelu, upconv, upnorm]
-            model = down + up
-        else:
-            upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc,
-                                        kernel_size=4, stride=2,
-                                        padding=1, bias=use_bias)
-            down = [downrelu, downconv, downnorm]
-            up = [uprelu, upconv, upnorm]
-
-            if use_dropout:
-                model = down + [submodule] + up + [nn.Dropout(0.5)]
-            else:
-                model = down + [submodule] + up
-
-        self.model = nn.Sequential(*model)
+    
+#defines a CBAM from the paper: https://arxiv.org/pdf/1807.06521.pdf 
+class CBAM(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(CBAM, self).__init__()
+        self.channel = channel
+        self.MLP = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(),
+            nn.Linear(channel // reduction, channel)
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        if self.outermost:
-            return self.model(x)
-        else:
-            return torch.cat([x, self.model(x)], 1)
+        avg_pool = F.avg_pool2d(x, x.size(2))
+        max_pool = F.max_pool2d(x, x.size(2))
+        avg_pool = avg_pool.view(avg_pool.size(0), -1)
+        max_pool = max_pool.view(max_pool.size(0), -1)
+        channel_avg = self.MLP(avg_pool)
+        channel_max = self.MLP(max_pool)
+        channel_attention = torch.sigmoid(channel_avg + channel_max).unsqueeze(2).unsqueeze(3).expand_as(x)
+        x = x * channel_attention
+        spatial_avg = torch.mean(x, dim=1, keepdim=True)
+        spatial_max, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_attention = torch.sigmoid(spatial_avg + spatial_max).expand_as(x)
+        x = x * spatial_attention
+        return x
+    
 
+#defines historical averaging as proposed in: https://arxiv.org/pdf/1606.03498.pdf
+class HistoricalAveraging:
+    def __init__(self, decay=0.99):
+        self.decay = decay  # Decay factor for the moving average
+        self.values = {}    # Dictionary to store current and running averages
+
+    def register_variable(self, name, variable):
+        # Register a variable to track and average
+        self.values[name] = {
+            'current': variable.clone().detach(),  # Initial value
+            'running_avg': variable.clone().detach(),  # Initial value for running average
+        }
+
+    def update_variable(self, name, variable):
+        # Update the current value of the variable
+        self.values[name]['current'] = variable
+
+    def compute_running_average(self, name):
+        # Update the running average using exponential moving average
+        current = self.values[name]['current']
+        running_avg = self.values[name]['running_avg']
+        running_avg = (self.decay * running_avg) + ((1 - self.decay) * current)
+        self.values[name]['running_avg'] = running_avg
+
+    def get_running_average(self, name):
+        # Get the running average of a variable
+        return self.values[name]['running_avg']
 
 # Defines the PatchGAN discriminator with the specified arguments.
 class NLayerDiscriminator(nn.Module):
@@ -564,8 +649,7 @@ class NLayerSetDiscriminator(nn.Module):
         feat = torch.cat([feat_img, feat_segs_sum], dim=1)
         out = self.classifier(feat)
         return out
-
-
+    
 class PixelDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, norm_layer=nn.BatchNorm2d, use_sigmoid=False):
         super(PixelDiscriminator, self).__init__()
@@ -589,3 +673,43 @@ class PixelDiscriminator(nn.Module):
 
     def forward(self, input):
         return self.net(input)
+
+
+# Define Total Variation Loss
+class TVLoss(nn.Module):
+    def __init__(self):
+        super(TVLoss, self).__init__()
+
+    def forward(self, x):
+        h_tv = torch.sum(torch.abs(x[:, :, :, :-1] - x[:, :, :, 1:]))
+        v_tv = torch.sum(torch.abs(x[:, :, :-1, :] - x[:, :, 1:, :]))
+        return h_tv + v_tv
+
+class StyleLoss(nn.Module):
+    def __init__(self):
+        super(StyleLoss, self).__init__()
+
+    def global_style_statistics(self, input):
+        b, c, h, w = input.size()
+        features = input.view(b, c, -1)
+        mean = torch.mean(features, dim=2, keepdim=True)
+        cov = torch.matmul(features - mean, (features - mean).permute(0, 2, 1)) / (h * w)
+        return mean, cov
+
+    def forward(self, x, y, mask_x, mask_y):
+        # Apply masks to input tensors x and y
+        x_masked = x * mask_x
+        y_masked = y * mask_y
+
+        # Calculate global style statistics for the masked regions
+        mean_x, cov_x = self.global_style_statistics(x_masked)
+        mean_y, cov_y = self.global_style_statistics(y_masked)
+
+        # Compute style loss using mean squared difference for mean and covariance
+        loss_mean = F.mse_loss(mean_x, mean_y)
+        loss_cov = F.mse_loss(cov_x, cov_y)
+
+        # Combine the losses (you can adjust the weights as needed)
+        loss = loss_mean + loss_cov
+        return loss
+
