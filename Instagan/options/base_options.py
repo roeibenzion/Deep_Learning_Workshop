@@ -12,7 +12,7 @@ class BaseOptions():
 
     def initialize(self, parser):
         parser.add_argument('--dataroot', required=True, help='path to images (should have subfolders trainA, trainB, valA, valB, etc)')
-        parser.add_argument('--batch_size', type=int, default=2, help='input batch size')
+        parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
         # Specify width and height for load and fine sizes
         parser.add_argument('--loadSizeW', type=int, default=220, help='scale images to this size (width)')
         parser.add_argument('--loadSizeH', type=int, default=220, help='scale images to this size (height)')
