@@ -6,6 +6,7 @@ from . import networks
 import numpy as np
 import copy
 import torch.nn as nn
+import torch.nn.functional as F
 
 class InstaGANModel(BaseModel):
     def name(self):
@@ -23,9 +24,7 @@ class InstaGANModel(BaseModel):
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_idt', type=float, default=1.0, help='use identity mapping. Setting lambda_idt other than 0 has an effect of scaling the weight of the identity mapping loss')
             parser.add_argument('--lambda_ctx', type=float, default=1.0, help='use context preserving. Setting lambda_ctx other than 0 has an effect of scaling the weight of the context preserving loss')
-                
-            parser.add_argument('--weak_D_factor', type=float, default=1.0, help='this num being multed with the lr of the discrim')
-            parser.add_argument('--use_attention', action='store_true', help='Enable self-attention mechanism in the encoder')      
+
         return parser
 
     def initialize(self, opt):
@@ -49,13 +48,17 @@ class InstaGANModel(BaseModel):
         # load/define networks
         # The naming conversion is different from those used in the paper
         # Code (paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
-        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
-        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.use_vggblock, opt.cbam)
+        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.use_vggblock, opt.cbam)
         if self.isTrain:
             use_sigmoid = opt.no_lsgan
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
             self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
-
+            if opt.TV_loss > 0:
+                self.TV_loss = networks.TVLoss()
+                self.weight_TV = opt.TV_loss
+            else:
+                self.TV_loss = None
         if self.isTrain:
             if len(self.gpu_ids) < -1:
                 print('pp1')
@@ -67,11 +70,13 @@ class InstaGANModel(BaseModel):
             self.fake_A_pool = ImagePool(opt.pool_size)
             self.fake_B_pool = ImagePool(opt.pool_size)
             # define loss functions
-            self.criterionGAN = networks.GANLoss(use_lsgan=not opt.no_lsgan).to(self.device)
+            self.use_WAGAN = opt.use_wgan
+            self.criterionGAN = networks.GANLoss(use_lsgan=not opt.no_lsgan, use_WAGAN=self.use_WAGAN, smooth_labels=opt.smooth).to(self.device)
             self.criterionCyc = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
+            
             self.optimizer_G = torch.optim.Adam(filter(lambda p: p.requires_grad, itertools.chain(self.netG_A.parameters(), self.netG_B.parameters())), lr=opt.lr, betas=(opt.beta1, 0.999))
-            self.optimizer_D = torch.optim.Adam(filter(lambda p: p.requires_grad, itertools.chain(self.netD_A.parameters(), self.netD_B.parameters())), lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_D = torch.optim.Adam(filter(lambda p: p.requires_grad, itertools.chain(self.netD_A.parameters(), self.netD_B.parameters())), lr=opt.lr*0.1, betas=(opt.beta1, 0.999))
             self.optimizers = []
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
@@ -120,16 +125,29 @@ class InstaGANModel(BaseModel):
         """L1 loss with given weight (used for context preserving loss)"""
         return torch.mean(weight * torch.abs(src - tgt))
 
+    def weighted_L1_loss_diff(self, src, tgt, weight):
+        """Modified L1 loss with given weight (used for context preserving loss)"""
+        difference = torch.abs(src - tgt)
+        #decay = torch.exp(-difference)
+        return torch.mean(weight * difference)
+
     def split(self, x):
         """Split data into image and mask (only assume 3-channel image)"""
         return x[:, :3, :, :], x[:, 3:, :, :]
+    
 
-    def set_input(self, input):
+    def set_input(self, input, epoch=-1):
+
+        if epoch%30 == 0:
+            #increase cycle consistency weight
+            self.opt.lambda_A *= 1.2
         AtoB = self.opt.direction == 'AtoB'
+        
         self.real_A_img = input['A' if AtoB else 'B'].to(self.device)
         self.real_B_img = input['B' if AtoB else 'A'].to(self.device)
         real_A_segs = input['A_segs' if AtoB else 'B_segs']
         real_B_segs = input['B_segs' if AtoB else 'A_segs']
+
         self.real_A_segs = self.select_masks(real_A_segs).to(self.device)
         self.real_B_segs = self.select_masks(real_B_segs).to(self.device)
         self.real_A = torch.cat([self.real_A_img, self.real_A_segs], dim=1)
@@ -138,6 +156,8 @@ class InstaGANModel(BaseModel):
         self.real_B_seg = self.merge_masks(self.real_B_segs)  # merged mask
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
+    
+    
     def forward(self, idx=0):
         N = self.opt.ins_per
         self.real_A_seg_sng = self.real_A_segs[:, N*idx:N*(idx+1), :, :]  # ith mask
@@ -177,6 +197,7 @@ class InstaGANModel(BaseModel):
             self.fake_A_seg_mul = torch.cat(fake_A_seg_list, dim=1)
             self.fake_A_mul = torch.cat([self.fake_A_img_sng, self.fake_A_seg_mul], dim=1)
 
+
     def test(self):
         self.real_A_img_sng = self.real_A_img
         self.real_B_img_sng = self.real_B_img
@@ -211,11 +232,14 @@ class InstaGANModel(BaseModel):
                 self.rec_A_seg = self.merge_masks(torch.cat(self.rec_A_seg_list, dim=1))
                 self.rec_B_seg = self.merge_masks(torch.cat(self.rec_B_seg_list, dim=1))
 
+
+    
     def backward_G(self):
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
         lambda_idt = self.opt.lambda_idt
         lambda_ctx = self.opt.lambda_ctx
+
 
         # backward A
         if self.forward_A:
@@ -224,6 +248,10 @@ class InstaGANModel(BaseModel):
             self.loss_idt_B = self.criterionIdt(self.netG_B(self.real_A_sng), self.real_A_sng.detach()) * lambda_A * lambda_idt
             weight_A = self.get_weight_for_ctx(self.real_A_seg_sng, self.fake_B_seg_sng)
             self.loss_ctx_A = self.weighted_L1_loss(self.real_A_img_sng, self.fake_B_img_sng, weight=weight_A) * lambda_A * lambda_ctx
+
+
+            self.loss_tv_A = self.TV_loss(self.fake_B_img_sng) * self.weight_TV if self.TV_loss is not None else 0
+            
         else:
             self.loss_G_A = 0
             self.loss_cyc_A = 0
@@ -237,6 +265,9 @@ class InstaGANModel(BaseModel):
             self.loss_idt_A = self.criterionIdt(self.netG_A(self.real_B_sng), self.real_B_sng.detach()) * lambda_B * lambda_idt
             weight_B = self.get_weight_for_ctx(self.real_B_seg_sng, self.fake_A_seg_sng)
             self.loss_ctx_B = self.weighted_L1_loss(self.real_B_img_sng, self.fake_A_img_sng, weight=weight_B) * lambda_B * lambda_ctx
+
+            self.loss_tv_B = self.TV_loss(self.fake_A_img_sng) * self.weight_TV if self.TV_loss is not None else 0
+            
         else:
             self.loss_G_B = 0
             self.loss_cyc_B = 0
@@ -244,21 +275,35 @@ class InstaGANModel(BaseModel):
             self.loss_ctx_B = 0
 
         # combined loss
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cyc_A + self.loss_cyc_B + self.loss_idt_A + self.loss_idt_B + self.loss_ctx_A + self.loss_ctx_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cyc_A + self.loss_cyc_B + self.loss_idt_A + self.loss_idt_B + self.loss_ctx_A + self.loss_ctx_B + self.loss_tv_A + self.loss_tv_B
+
+        # Backward pass
         self.loss_G.backward()
 
-    def backward_D_basic(self, netD, real, fake):
+
+    def backward_D_basic(self, netD, real, fake, suffix='A'):
         # Real
         pred_real = netD(real)
         loss_D_real = self.criterionGAN(pred_real, True)
+        
         # Fake
         pred_fake = netD(fake.detach())
         loss_D_fake = self.criterionGAN(pred_fake, False)
+        
         # Combined loss
         loss_D = (loss_D_real + loss_D_fake) * 0.5
-        # backward
+        
+        if self.use_WAGAN:
+            # Compute the gradient penalty
+            gradient_penalty, _ = networks.cal_gradient_penalty(netD, real, fake.detach(), self.device)
+            
+            # Add the gradient penalty to the loss
+            loss_D +=  gradient_penalty  
+        # Backward
         loss_D.backward()
+    
         return loss_D
+
 
     def backward_D_A(self):
         fake_B = self.fake_B_pool.query(self.fake_B_mul)
@@ -318,3 +363,5 @@ class InstaGANModel(BaseModel):
                 self.fake_B_seg = self.merge_masks(self.fake_B_seg_mul)
                 self.rec_A_seg = self.merge_masks(torch.cat(self.rec_A_seg_list, dim=1))
                 self.rec_B_seg = self.merge_masks(torch.cat(self.rec_B_seg_list, dim=1))
+
+    
