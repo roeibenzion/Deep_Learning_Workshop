@@ -14,3 +14,5 @@ A Google Colab notebook is provided for test.
 3. Utilize Google Colab's GPU runtime.
 4. Run all cells in the notebook. Upon execution, real images will be displayed alongside their generated 'fake' counterparts for comparative analysis.
 
+For more results from test sets, visit here:
+https://drive.google.com/drive/folders/1hOP_FoEsz12vi0HUgcDEeJgeR6SW7Boq
