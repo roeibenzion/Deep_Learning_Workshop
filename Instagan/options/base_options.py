@@ -52,6 +52,11 @@ class BaseOptions():
         parser.add_argument('--suffix', default='', type=str, help='customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{loadSize}')
         parser.add_argument('--block', type=str, default='resnet', help='choose resnet or resnext block')
         parser.add_argument('--deep', action='store_true', help='use deeper generator')
+        parser.add_argument('--block', type = str, default = 'resnet', help='block to use - [resnrt | dense| resnext]')
+        parser.add_argument('--use_SE', action='store_true', help='use squeeze and excitation module')
+        parser.add_argument('--smooth', action='store_true', help='use one sided label smoothing')
+        parser.add_argument('--cbam', action='store_true', help='use attention module')
+        parser.add_argument('--cbam_reduction', type=int, default=16, help='reduction ratio for cbam')
         self.initialized = True
         return parser
 
