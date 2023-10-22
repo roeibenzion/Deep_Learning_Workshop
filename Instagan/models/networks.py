@@ -10,7 +10,7 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import math
-
+import torchvision
 
 
 ###############################################################################
@@ -80,14 +80,14 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], cbam=False):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], block = 'resnet', cbam=False, SE = False, reduction=16, deep = False):
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
 
     if netG == 'basic':
         net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
     elif netG == 'set':
-        net = ResnetSetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9, vgg=False, cbam=cbam)
+        net = ResnetSetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9, block=block, cbam=cbam, SE=SE, reduction=reduction, deep=deep)
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
@@ -153,6 +153,7 @@ class GANLoss(nn.Module):
             else:
                 loss = input.mean()
         return loss
+
 
    
 def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', constant=1.0, lambda_gp=10.0):
@@ -293,13 +294,17 @@ class ResnetGenerator(nn.Module):
 # ResNet generator for "set" of instance attributes
 # See https://openreview.net/forum?id=ryxwJhC9YX for details
 class ResnetSetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', vgg=False, cbam=False):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect', block='resnet', cbam=False, SE = False,reduction=16, deep = False):
         assert (n_blocks >= 0)
         super(ResnetSetGenerator, self).__init__()
         self.input_nc = input_nc
         self.output_nc = output_nc
         self.ngf = ngf
         self.use_CBAM = cbam 
+        self.reduction = reduction
+        self.block = block
+        self.se = SE
+        self.deep = deep
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm2d
         else:
@@ -311,7 +316,7 @@ class ResnetSetGenerator(nn.Module):
         self.decoder_img = self.get_decoder(output_nc, n_downsampling, 2 * ngf, norm_layer, use_bias)  # 2*ngf
         self.decoder_seg = self.get_decoder(1, n_downsampling, 3 * ngf, norm_layer, use_bias)  # 3*ngf
         
-    def get_encoder(self, input_nc, n_downsampling, ngf, norm_layer, use_dropout, n_blocks, padding_type, use_bias, vgg=False):
+    def get_encoder(self, input_nc, n_downsampling, ngf, norm_layer, use_dropout, n_blocks, padding_type, use_bias):
         model = [nn.ReflectionPad2d(3),
                  nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias)]
         
@@ -326,12 +331,15 @@ class ResnetSetGenerator(nn.Module):
             model += [nn.ReLU(True)]
 
         mult = 2 ** n_downsampling
+    
         for i in range(n_blocks):
-            if not vgg:
-                model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, cbam=self.use_CBAM)]
+            if self.block == 'resnet':
+                model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, cbam=self.use_CBAM, SE=self.se, reduction=self.reduction, deep=self.deep)]
+            elif self.block == 'resnext':
+                model += [ResNeXtBlock(ngf * mult, out_channels=ngf * mult, cardinality=64)]
             else:
-                model += [VGGBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
-
+                raise NotImplementedError('Generator model name [%s] is not recognized' % self.block)
+        
         return nn.Sequential(*model)
     
     def get_decoder(self, output_nc, n_downsampling, ngf, norm_layer, use_bias):
@@ -347,7 +355,7 @@ class ResnetSetGenerator(nn.Module):
         model += [nn.Tanh()]
         return nn.Sequential(*model)
     
-    def forward(self, inp, resolution=None):
+    def forward(self, inp):
         # split data
         img = inp[:, :self.input_nc, :, :]  # (B, CX, W, H)
         segs = inp[:, self.input_nc:, :, :]  # (B, CA, W, H)
@@ -376,15 +384,35 @@ class ResnetSetGenerator(nn.Module):
             else:
                 out += [segs[:, i, :, :].unsqueeze(1)]  # skip empty segmentation
         return torch.cat(out, dim=1)
-    
+
+
+#definc SE (squeeze and excitation) block
+class SEBlock(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
 # Define a resnet block
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias, cbam=False):
+    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias, cbam=False, SE=False, reduction=16, deep=False):
         super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
-        self.cbam = CBAM(dim) if cbam else None
+        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias, deep)
+        self.cbam = CBAM(dim, reduction=reduction) if cbam else None
+        self.se = SEBlock(dim, reduction=reduction) if SE else None
 
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
+    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias, deep):
         conv_block = []
         p = 0
         if padding_type == 'reflect':
@@ -402,6 +430,13 @@ class ResnetBlock(nn.Module):
         if use_dropout:
             conv_block += [nn.Dropout(0.5)]
 
+        if deep:
+            p = 1
+            conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
+                       norm_layer(dim),
+                       nn.ReLU(True)]
+            if use_dropout:
+                conv_block += [nn.Dropout(0.5)]
         p = 0
         if padding_type == 'reflect':
             conv_block += [nn.ReflectionPad2d(1)]
@@ -413,63 +448,76 @@ class ResnetBlock(nn.Module):
             raise NotImplementedError('padding [%s] is not implemented' % padding_type)
         conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
                        norm_layer(dim)]
+
         return nn.Sequential(*conv_block)
 
     def forward(self, x):
         #out = x + self.conv_block(x)
+        if self.cbam is not None and self.se is not None:
+            raise NotImplementedError('Cannot use both CBAM and SE')
         out = self.conv_block(x)
         if self.cbam is not None:
             residual = out.clone()  
             out = self.cbam(out)
             out += residual  
             out = nn.ReLU(True)(out)
+        elif self.se is not None:
+            residual = x  
+            out = self.se(out)
+            out += residual  
         else:
             out += x  
         return out
 
+# Define a resnext block
+class ResNeXtBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, cardinality=32, reduction=16):
+        super(ResNeXtBlock, self).__init__()
 
-class VGGBlock(nn.Module):
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        super(VGGBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        # Calculate the number of grouped channels
+        mid_channels = cardinality * out_channels // reduction
 
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        conv_block = []
-        p = 1  # Set padding to 1 to match ResNet
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
+        # Create the grouped convolution layers
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0)
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=stride, padding=1, groups=cardinality)
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+        # Batch normalization layers and ReLU activations
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+
+        # Optional downsample layer for the residual connection
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
         else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
-                       norm_layer(dim),
-                       nn.ReLU(True)]
-        if use_dropout:
-            conv_block += [nn.Dropout(0.5)]
-
-        p = 1  # Set padding to 1 to match ResNet
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
-        else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias),
-                       norm_layer(dim)]
-
-        return nn.Sequential(*conv_block)
+            self.downsample = None
 
     def forward(self, x):
-        out = x + self.conv_block(x)
-        return out
+        residual = x
 
-    
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
 #defines a CBAM from the paper: https://arxiv.org/pdf/1807.06521.pdf 
 class CBAM(nn.Module):
     def __init__(self, channel, reduction=16):
@@ -497,35 +545,27 @@ class CBAM(nn.Module):
         x = x * spatial_attention
         return x
     
+class DenseBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate, num_layers, norm_layer, use_dropout, use_bias):
+        super(DenseBlock, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            # Compute the input channels for the current layer
+            input_channels = in_channels + i * growth_rate
 
-#defines historical averaging as proposed in: https://arxiv.org/pdf/1606.03498.pdf
-class HistoricalAveraging:
-    def __init__(self, decay=0.99):
-        self.decay = decay  # Decay factor for the moving average
-        self.values = {}    # Dictionary to store current and running averages
+            # Dense layer with Batch Normalization and ReLU
+            layers += [nn.Conv2d(input_channels, growth_rate, kernel_size=3, stride=1, padding=1, bias=use_bias),
+                       norm_layer(growth_rate),
+                       nn.ReLU(True)]
+            
+            # Optionally, add dropout
+            if use_dropout:
+                layers += [nn.Dropout(0.5)]
+        
+        self.dense_layers = nn.Sequential(*layers)
 
-    def register_variable(self, name, variable):
-        # Register a variable to track and average
-        self.values[name] = {
-            'current': variable.clone().detach(),  # Initial value
-            'running_avg': variable.clone().detach(),  # Initial value for running average
-        }
-
-    def update_variable(self, name, variable):
-        # Update the current value of the variable
-        self.values[name]['current'] = variable
-
-    def compute_running_average(self, name):
-        # Update the running average using exponential moving average
-        current = self.values[name]['current']
-        running_avg = self.values[name]['running_avg']
-        running_avg = (self.decay * running_avg) + ((1 - self.decay) * current)
-        self.values[name]['running_avg'] = running_avg
-
-    def get_running_average(self, name):
-        # Get the running average of a variable
-        return self.values[name]['running_avg']
-
+    def forward(self, x):
+        return torch.cat([x, self.dense_layers(x)], 1)
 # Defines the PatchGAN discriminator with the specified arguments.
 class NLayerDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, use_sigmoid=False):
