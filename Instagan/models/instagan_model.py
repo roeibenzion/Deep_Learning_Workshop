@@ -48,8 +48,9 @@ class InstaGANModel(BaseModel):
         # load/define networks
         # The naming conversion is different from those used in the paper
         # Code (paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
-        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.cbam)
-        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.cbam)
+        deep = True if opt.deep else False
+        self.netG_A = networks.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.block, opt.cbam, opt.use_SE, opt.cbam_reduction, deep)
+        self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm, not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids, opt.block, opt.cbam, opt.use_SE, opt.cbam_reduction, deep)
         if self.isTrain:
             use_sigmoid = opt.no_lsgan
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD, opt.n_layers_D, opt.norm, use_sigmoid, opt.init_type, opt.init_gain, self.gpu_ids)
@@ -137,6 +138,7 @@ class InstaGANModel(BaseModel):
     
 
     def set_input(self, input, epoch=-1):
+
         AtoB = self.opt.direction == 'AtoB'
         
         self.real_A_img = input['A' if AtoB else 'B'].to(self.device)
@@ -244,9 +246,6 @@ class InstaGANModel(BaseModel):
             self.loss_idt_B = self.criterionIdt(self.netG_B(self.real_A_sng), self.real_A_sng.detach()) * lambda_A * lambda_idt
             weight_A = self.get_weight_for_ctx(self.real_A_seg_sng, self.fake_B_seg_sng)
             self.loss_ctx_A = self.weighted_L1_loss(self.real_A_img_sng, self.fake_B_img_sng, weight=weight_A) * lambda_A * lambda_ctx
-
-
-            self.loss_tv_A = self.TV_loss(self.fake_B_img_sng) * self.weight_TV if self.TV_loss is not None else 0
             
         else:
             self.loss_G_A = 0
@@ -261,8 +260,6 @@ class InstaGANModel(BaseModel):
             self.loss_idt_A = self.criterionIdt(self.netG_A(self.real_B_sng), self.real_B_sng.detach()) * lambda_B * lambda_idt
             weight_B = self.get_weight_for_ctx(self.real_B_seg_sng, self.fake_A_seg_sng)
             self.loss_ctx_B = self.weighted_L1_loss(self.real_B_img_sng, self.fake_A_img_sng, weight=weight_B) * lambda_B * lambda_ctx
-
-            self.loss_tv_B = self.TV_loss(self.fake_A_img_sng) * self.weight_TV if self.TV_loss is not None else 0
             
         else:
             self.loss_G_B = 0
@@ -270,6 +267,8 @@ class InstaGANModel(BaseModel):
             self.loss_idt_A = 0
             self.loss_ctx_B = 0
 
+        self.loss_tv_A = self.TV_loss(self.fake_B_img_sng) * self.weight_TV if self.TV_loss is not None else 0
+        self.loss_tv_B = self.TV_loss(self.fake_A_img_sng) * self.weight_TV if self.TV_loss is not None else 0
         # combined loss
         self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cyc_A + self.loss_cyc_B + self.loss_idt_A + self.loss_idt_B + self.loss_ctx_A + self.loss_ctx_B + self.loss_tv_A + self.loss_tv_B
 
