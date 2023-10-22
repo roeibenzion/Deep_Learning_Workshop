@@ -33,9 +33,6 @@ class TrainOptions(BaseOptions):
         parser.add_argument('--more_aug', type=float, default=0.0, help='weight for content loss')
         parser.add_argument('--use_wgan', action='store_true', help='type to use WGAN-GP loss')
         parser.add_argument('--use_vggblock', action='store_true', help='use VGGblock instead of resnetblock')
-        parser.add_argument('--smooth', action='store_true', help='use one sided label smoothing')
-        parser.add_argument('--cbam', action='store_true', help='use attention module')
-        parser.add_argument('--restarted', action='store_true', help='use restarted method')
 
         self.isTrain = True
         return parser
